@@ -44,13 +44,21 @@ class CompressedHistoryCallback(BaseCallback):
         # This is used to detect on-policy segments
         if hasattr(self.model, 'policy'):
             with np.errstate(invalid='ignore'):  # Ignore any division warnings
+                import torch
+                
                 # Get action distribution from current policy
                 obs_tensor = self.locals["obs_tensor"]
-                actions_tensor = self.locals["actions"]
+                actions = self.locals["actions"]
+                
+                # Convert actions to tensor if needed
+                if not isinstance(actions, torch.Tensor):
+                    actions_tensor = torch.as_tensor(actions, device=obs_tensor.device)
+                else:
+                    actions_tensor = actions
                 
                 # Get log probabilities
                 _, log_prob, _ = self.model.policy.evaluate_actions(obs_tensor, actions_tensor)
-                action_prob = np.exp(log_prob.cpu().numpy())
+                action_prob = np.exp(log_prob.detach().cpu().numpy())
                 
                 self.action_probs.append(action_prob)
         else:
