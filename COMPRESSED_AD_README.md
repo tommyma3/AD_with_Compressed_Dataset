@@ -1,5 +1,65 @@
 # Compressed Algorithm Distillation
 
+## Quick Start
+
+This implementation modifies Algorithm Distillation to learn from **on-policy segments** marked with compression tokens. The transformer learns to predict actions using context between `<compress>` and `\compress>` tokens, aligning with how PPO updates on near-on-policy data.
+
+### Three Simple Steps
+
+```bash
+# 1. Collect data with compression marking
+python collect_with_compression.py
+
+# 2. Train the compressed AD model
+python train_with_compression.py
+
+# 3. Visualize compression patterns
+python visualize_compression.py
+```
+
+## What's Different?
+
+### Standard AD
+```
+Context: [x1, x2, x3, x4, x5, ..., xn] → Query → Predict Action
+         ↑ All transitions treated equally
+```
+
+### Compressed AD
+```
+Context: [x1, x2, <compress>, x3, x4, x5, \compress>, x6, ..., xn] → Query → Predict Action
+                            ↑_____________↑
+                         On-policy segment
+                    (high-confidence transitions)
+```
+
+The model learns to focus on transitions inside compression tokens (the on-policy, high-quality data).
+
+## How It Works
+
+1. **During PPO training**, track action probabilities:
+   - High probability (≥0.7) = action matches what policy prefers = **on-policy**
+   - Low probability (<0.7) = exploratory action = **off-policy**
+
+2. **Mark consecutive on-policy steps** with compression tokens:
+   ```
+   Timesteps: 0   1   2   3   4   5   6   7   8   9
+   Probs:     0.4 0.8 0.9 0.8 0.75 0.72 0.6 0.5 0.4 0.85
+   Mask:      0   1   1   1   1    1    0   0   0   1
+              ↑   ↑________________________↑           ↑
+           off  <compress> on-policy \compress>    off
+   ```
+
+3. **During AD pretraining**, add learned embeddings at boundaries:
+   - `embed_compress_start` at positions where compression begins
+   - `embed_compress_end` at positions where compression ends
+
+4. **Transformer learns** to recognize these markers and focus on high-quality context
+
+---
+
+# Compressed Algorithm Distillation - Implementation Guide
+
 This implementation extends Algorithm Distillation with compression tokens to enable efficient learning from on-policy segments.
 
 ## 🎯 Overview
