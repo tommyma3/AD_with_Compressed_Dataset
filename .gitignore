@@ -1,0 +1,6 @@
+logs/
+runs/
+datasets/
+figs/attention_analysis/attention_history.pkl
+.gitattributes
+__pycache__/
