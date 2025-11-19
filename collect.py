@@ -27,7 +27,7 @@ def worker(arg, config, traj_dir, env_idx, history, file_name):
     config['device'] = 'cpu'
 
     alg = ALGORITHM[alg_name](config, env, seed, traj_dir)
-    callback = HistoryLoggerCallback(config['env'], env_idx, history)
+    callback = HistoryLoggerCallback(config['env'], env_idx, history, compress_interval=config['n_steps'])
     log_name = f'{file_name}_{env_idx}'
     
     alg.learn(total_timesteps=config['total_source_timesteps'],

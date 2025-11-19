@@ -40,6 +40,14 @@ def ad_collate_fn(batch, grid_size):
     res['rewards'] = torch.tensor(np.array([item['rewards'] for item in batch]), dtype=torch.float, requires_grad=False)
     res['next_states'] = torch.tensor(np.array([item['next_states'] for item in batch]), requires_grad=False, dtype=torch.float)
     
+    # Handle compress markers if present
+    if 'compress_markers' in batch[0]:
+        res['compress_markers'] = torch.tensor(np.array([item['compress_markers'] for item in batch]), requires_grad=False, dtype=torch.long)
+    
+    # Handle target token types if present
+    if 'target_token_types' in batch[0]:
+        res['target_token_types'] = torch.tensor(np.array([item['target_token_types'] for item in batch]), requires_grad=False, dtype=torch.long)
+    
     if 'target_next_states' in batch[0].keys():
         res['target_next_states'] = map_dark_states(torch.tensor(np.array([item['target_next_states'] for item in batch]), dtype=torch.long, requires_grad=False), grid_size=grid_size)
         res['target_rewards'] = torch.tensor(np.array([item['target_rewards'] for item in batch]), dtype=torch.long, requires_grad=False)

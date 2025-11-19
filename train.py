@@ -133,6 +133,12 @@ if __name__ == '__main__':
                 writer.add_scalar('train/loss_action', output['loss_action'], step)
                 writer.add_scalar('train/lr', lr_sched.get_last_lr()[0], step)
                 writer.add_scalar('train/acc_action', output['acc_action'].item(), step)
+                
+                # Log compressed context specific metrics if enabled
+                if config.get('use_compressed_context', False):
+                    if 'loss_token_type' in output:
+                        writer.add_scalar('train/loss_token_type', output['loss_token_type'].item(), step)
+                        writer.add_scalar('train/acc_token_type', output['acc_token_type'].item(), step)
 
 
             # Eval
