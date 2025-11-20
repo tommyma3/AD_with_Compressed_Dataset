@@ -95,11 +95,11 @@ class AD(torch.nn.Module):
 
     def forward(self, x):
         query_states = x['query_states'].to(self.device)  # (batch_size, dim_state)
-        target_actions = x['target_actions'].to(self.device)  # (batch_size,)
-        states = x['states'].to(self.device)  # (batch_size, num_transit, dim_state)
-        actions = x['actions'].to(self.device)  # (batch_size, num_transit, num_actions)
-        next_states = x['next_states'].to(self.device)  # (batch_size, num_transit, dim_state)
-        rewards = x['rewards'].to(self.device)  # (batch_size, num_transit)
+        target_actions = x['target_actions'].to(self.device) if 'target_actions' in x else None  # (batch_size,)
+        states = x['states'].to(self.device)  # (batch_size, num_transitions, dim_state)
+        actions = x['actions'].to(self.device)  # (batch_size, num_transitions, num_actions)
+        next_states = x['next_states'].to(self.device)  # (batch_size, num_transitions, dim_state)
+        rewards = x['rewards'].to(self.device)  # (batch_size, num_transitions)
         rewards = rearrange(rewards, 'b n -> b n 1')
 
         query_states_embed = self.embed_query_state(map_dark_states(query_states, self.grid_size).to(torch.long))
@@ -108,37 +108,69 @@ class AD(torch.nn.Module):
         context, _ = pack([states, actions, rewards, next_states], 'b n *')
         context_embed = self.embed_context(context)
         
-        # Add token type embeddings for context (all transitions)
-        batch_size, seq_len, _ = context_embed.shape
-        token_types = torch.zeros(batch_size, seq_len, dtype=torch.long, device=self.device)
-        context_embed = context_embed + self.token_type_embedding(token_types)
+        batch_size, seq_len, emb_dim = context_embed.shape
         
-        # Handle compressed context mode
-        if self.use_compressed_context and 'compress_markers' in x:
-            compress_markers = x['compress_markers'].to(self.device)  # (batch_size, num_transit)
-            # compress_markers: 0=normal, 1=compress_start, 2=compress_end
+        # In compressed context mode, INSERT compression tokens as separate sequence elements
+        if self.use_compressed_context and 'prev_region_len' in x:
+            prev_region_len = x['prev_region_len']
+            curr_region_len = x['curr_region_len']
             
-            # Insert special tokens at marked positions
+            # Build sequence: <compress> prev_region </compress> <compress> curr_region <query>
             embeds_list = []
             for b in range(batch_size):
                 seq_embeds = []
-                for t in range(seq_len):
-                    if compress_markers[b, t] == 1:  # compress_start
-                        token_embed = self.compress_start_token.squeeze(0)
-                        token_embed = token_embed + self.token_type_embedding(
-                            torch.tensor([1], device=self.device))
-                        seq_embeds.append(token_embed)
-                    elif compress_markers[b, t] == 2:  # compress_end
-                        token_embed = self.compress_end_token.squeeze(0)
-                        token_embed = token_embed + self.token_type_embedding(
-                            torch.tensor([2], device=self.device))
-                        seq_embeds.append(token_embed)
-                    else:  # normal transition
-                        seq_embeds.append(context_embed[b:b+1, t])
+                
+                # Previous region with markers
+                # <compress>
+                compress_start_embed = self.compress_start_token.squeeze(0) + self.token_type_embedding(
+                    torch.tensor([1], device=self.device))
+                seq_embeds.append(compress_start_embed)
+                
+                # Previous region transitions
+                for t in range(prev_region_len):
+                    trans_embed = context_embed[b, t] + self.token_type_embedding(
+                        torch.tensor([0], device=self.device))
+                    seq_embeds.append(trans_embed)
+                
+                # </compress>
+                compress_end_embed = self.compress_end_token.squeeze(0) + self.token_type_embedding(
+                    torch.tensor([2], device=self.device))
+                seq_embeds.append(compress_end_embed)
+                
+                # Current region with start marker
+                # <compress>
+                compress_start_embed = self.compress_start_token.squeeze(0) + self.token_type_embedding(
+                    torch.tensor([1], device=self.device))
+                seq_embeds.append(compress_start_embed)
+                
+                # Current region transitions
+                for t in range(curr_region_len):
+                    trans_embed = context_embed[b, prev_region_len + t] + self.token_type_embedding(
+                        torch.tensor([0], device=self.device))
+                    seq_embeds.append(trans_embed)
+                
+                # Query state
+                query_embed = query_states_embed[b] + self.token_type_embedding(
+                    torch.tensor([0], device=self.device))
+                seq_embeds.append(query_embed)
+                
                 embeds_list.append(torch.cat(seq_embeds, dim=0))
-            context_embed = torch.stack(embeds_list, dim=0)
-        
-        context_embed, _ = pack([context_embed, query_states_embed], 'b * d')
+            
+            # Stack and pad to same length
+            max_len = max(e.size(0) for e in embeds_list)
+            padded_embeds = []
+            for embeds in embeds_list:
+                if embeds.size(0) < max_len:
+                    pad = torch.zeros(max_len - embeds.size(0), emb_dim, device=self.device)
+                    embeds = torch.cat([embeds, pad], dim=0)
+                padded_embeds.append(embeds)
+            
+            context_embed = torch.stack(padded_embeds, dim=0)
+        else:
+            # Original mode: just concat context + query
+            token_types = torch.zeros(batch_size, seq_len, dtype=torch.long, device=self.device)
+            context_embed = context_embed + self.token_type_embedding(token_types)
+            context_embed, _ = pack([context_embed, query_states_embed], 'b * d')
 
         # Apply causal masking during training to prevent future information leakage
         transformer_output = self.transformer(context_embed,
@@ -149,24 +181,37 @@ class AD(torch.nn.Module):
         result = {}
 
         # The last token in the sequence is the query state embedding
-        # Predict action from this position
+        # Predict action OR compression token from this position
         logits_actions = self.pred_action(transformer_output[:, -1])  # (batch_size, num_actions)
         logits_token_type = self.pred_token_type(transformer_output[:, -1])  # (batch_size, 3)
-
-        loss_full_action = self.loss_fn(logits_actions, target_actions)
-        acc_full_action = (logits_actions.argmax(dim=-1) == target_actions).float().mean()
-
-        result['loss_action'] = loss_full_action
-        result['acc_action'] = acc_full_action
         
-        # In compressed context mode, predict token types for special tokens
-        if self.use_compressed_context and 'target_token_types' in x:
-            target_token_types = x['target_token_types'].to(self.device)
-            loss_token_type = self.token_type_loss_fn(logits_token_type, target_token_types)
-            acc_token_type = (logits_token_type.argmax(dim=-1) == target_token_types).float().mean()
+        # Determine what we're predicting based on target_token_type
+        if self.use_compressed_context and 'target_token_type' in x:
+            target_token_type = x['target_token_type'].to(self.device) if torch.is_tensor(x['target_token_type']) else torch.tensor(x['target_token_type'], device=self.device)
+            
+            # Token type loss (always computed)
+            loss_token_type = self.token_type_loss_fn(logits_token_type, target_token_type)
+            acc_token_type = (logits_token_type.argmax(dim=-1) == target_token_type).float().mean()
+            
+            # Action loss (only for action predictions, where target_token_type == 0)
+            action_mask = (target_token_type == 0)
+            if action_mask.any() and target_actions is not None:
+                loss_action = self.loss_fn(logits_actions[action_mask], target_actions[action_mask])
+                acc_action = (logits_actions[action_mask].argmax(dim=-1) == target_actions[action_mask]).float().mean()
+            else:
+                loss_action = torch.tensor(0.0, device=self.device)
+                acc_action = torch.tensor(0.0, device=self.device)
+            
             result['loss_token_type'] = loss_token_type
             result['acc_token_type'] = acc_token_type
-            result['loss_action'] = loss_full_action + 0.1 * loss_token_type  # Combined loss
+            result['loss_action'] = loss_action + 0.1 * loss_token_type  # Combined loss
+            result['acc_action'] = acc_action
+        else:
+            # Standard mode
+            loss_action = self.loss_fn(logits_actions, target_actions)
+            acc_action = (logits_actions.argmax(dim=-1) == target_actions).float().mean()
+            result['loss_action'] = loss_action
+            result['acc_action'] = acc_action
 
         return result
 
@@ -180,40 +225,75 @@ class AD(torch.nn.Module):
         query_states = torch.tensor(query_states, device=self.device, requires_grad=False, dtype=torch.long)
         query_states = rearrange(query_states, 'e d -> e 1 d')
         query_states_embed = self.embed_query_state(map_dark_states(query_states, self.grid_size))
-        transformer_input = query_states_embed
+        
+        # Initialize with compress_start token
+        compress_start_embed = self.compress_start_token.expand(query_states_embed.shape[0], -1, -1)
+        compress_start_embed = compress_start_embed + self.token_type_embedding(
+            torch.full((query_states_embed.shape[0], 1), 1, dtype=torch.long, device=self.device))
+        
+        transformer_input, _ = pack([compress_start_embed, query_states_embed], 'e * h')
         
         # Track compression regions if using compressed context
-        steps_in_compression = 0
-        compression_context = None  # Store previous compression region
-        current_compression = []  # Accumulate current compression region
+        if self.use_compressed_context:
+            current_region = [compress_start_embed]  # Current compression region
+            previous_region = None  # Previous complete region
+            steps_in_region = 0
 
         for step in range(eval_timesteps):
             query_states_prev = query_states.clone().detach().to(torch.float)
 
-            # During evaluation, we still use causal masking for consistency
+            # Forward pass with causal masking
             output = self.transformer(transformer_input,
                                         max_seq_length=self.max_seq_length,
                                         dtype='fp32',
                                         use_causal_mask=True)
 
-            logits = self.pred_action(output[:, -1])
+            # Predict both action and token type
+            logits_action = self.pred_action(output[:, -1])
+            logits_token_type = self.pred_token_type(output[:, -1])
+            predicted_token_type = logits_token_type.argmax(dim=-1)
             
-            if self.use_compressed_context:
-                # Also predict token type to detect compression boundaries
-                logits_token_type = self.pred_token_type(output[:, -1])
-                predicted_token_type = logits_token_type.argmax(dim=-1)
-
+            # Check if we should emit compress_end token
+            if self.use_compressed_context and (predicted_token_type == 2).any():
+                # Emit compress_end token, finalize current region, start new region
+                compress_end_embed = self.compress_end_token.expand(query_states_embed.shape[0], -1, -1)
+                compress_end_embed = compress_end_embed + self.token_type_embedding(
+                    torch.full((query_states_embed.shape[0], 1), 2, dtype=torch.long, device=self.device))
+                
+                current_region.append(compress_end_embed)
+                
+                # Save current region as previous, prune old previous
+                previous_region = torch.cat(current_region, dim=1) if len(current_region) > 1 else current_region[0]
+                
+                # Start new region with compress_start
+                compress_start_embed = self.compress_start_token.expand(query_states_embed.shape[0], -1, -1)
+                compress_start_embed = compress_start_embed + self.token_type_embedding(
+                    torch.full((query_states_embed.shape[0], 1), 1, dtype=torch.long, device=self.device))
+                
+                current_region = [compress_start_embed]
+                steps_in_region = 0
+                
+                # Rebuild transformer input: previous_region + current_region + query
+                if previous_region is not None:
+                    transformer_input, _ = pack([previous_region, compress_start_embed, query_states_embed], 'e * h')
+                else:
+                    transformer_input, _ = pack([compress_start_embed, query_states_embed], 'e * h')
+                
+                # Continue to next step without taking action
+                continue
+            
+            # Sample action
             if sample:
-                log_probs = F.log_softmax(logits, dim=-1)
+                log_probs = F.log_softmax(logits_action, dim=-1)
                 actions = torch.multinomial(log_probs.exp(), num_samples=1)
                 actions = rearrange(actions, 'e 1 -> e')
             else:
-                actions = logits.argmax(dim=-1)
+                actions = logits_action.argmax(dim=-1)
 
             query_states, rewards, dones, infos = vec_env.step(actions.cpu().numpy())
 
-            actions = rearrange(actions, 'e -> e 1 1')
-            actions = F.one_hot(actions, num_classes=self.config['num_actions'])
+            actions_onehot = rearrange(actions, 'e -> e 1 1')
+            actions_onehot = F.one_hot(actions_onehot, num_classes=self.config['num_actions'])
 
             reward_episode += rewards
             rewards = torch.tensor(rewards, device=self.device, requires_grad=False, dtype=torch.float)
@@ -228,14 +308,14 @@ class AD(torch.nn.Module):
 
                 states_next = torch.tensor(np.stack([info['terminal_observation'] for info in infos]),
                                            device=self.device, dtype=torch.float)
-
                 states_next = rearrange(states_next, 'e d -> e 1 d')
             else:
                 states_next = query_states.clone().detach().to(torch.float)
 
             query_states_embed = self.embed_query_state(map_dark_states(query_states, self.grid_size))
 
-            context, _ = pack([query_states_prev, actions, rewards, states_next], 'e i *')
+            # Build transition embedding
+            context, _ = pack([query_states_prev, actions_onehot, rewards, states_next], 'e i *')
             context_embed = self.embed_context(context)
             
             # Add token type embedding for regular transitions
@@ -245,43 +325,20 @@ class AD(torch.nn.Module):
             
             # Handle compressed context mode during evaluation
             if self.use_compressed_context:
-                steps_in_compression += 1
-                current_compression.append(context_embed)
+                steps_in_region += 1
+                current_region.append(context_embed)
                 
-                # Check if we should insert compression markers
-                if steps_in_compression == self.compress_interval:
-                    # Add compress_end token
-                    compress_end_embed = self.compress_end_token.expand(context_embed.shape[0], -1, -1)
-                    compress_end_embed = compress_end_embed + self.token_type_embedding(
-                        torch.full((context_embed.shape[0], 1), 2, dtype=torch.long, device=self.device))
-                    current_compression.append(compress_end_embed)
-                    
-                    # Save current compression as previous
-                    compression_context = torch.cat(current_compression, dim=1)
-                    
-                    # Start new compression region
-                    current_compression = []
-                    steps_in_compression = 0
-                    
-                    # Add compress_start token
-                    compress_start_embed = self.compress_start_token.expand(context_embed.shape[0], -1, -1)
-                    compress_start_embed = compress_start_embed + self.token_type_embedding(
-                        torch.full((context_embed.shape[0], 1), 1, dtype=torch.long, device=self.device))
-                    current_compression.append(compress_start_embed)
-                
-                # Build context from last compression region + current compression region
-                if compression_context is not None and len(current_compression) > 0:
-                    combined_context = torch.cat([compression_context] + current_compression, dim=1)
-                elif len(current_compression) > 0:
-                    combined_context = torch.cat(current_compression, dim=1)
+                # Rebuild transformer input from regions
+                if previous_region is not None:
+                    current_region_cat = torch.cat(current_region, dim=1)
+                    transformer_input, _ = pack([previous_region, current_region_cat, query_states_embed], 'e * h')
                 else:
-                    combined_context = context_embed
-                    
+                    current_region_cat = torch.cat(current_region, dim=1) if len(current_region) > 1 else current_region[0]
+                    transformer_input, _ = pack([current_region_cat, query_states_embed], 'e * h')
+                
                 # Limit context length
-                if combined_context.size(1) > self.n_transit - 1:
-                    combined_context = combined_context[:, -(self.n_transit-1):]
-                    
-                transformer_input, _ = pack([combined_context, query_states_embed], 'e * h')
+                if transformer_input.size(1) > self.n_transit:
+                    transformer_input = transformer_input[:, -self.n_transit:]
             else:
                 # Original logic without compression
                 if transformer_input.size(1) > 1:

@@ -180,17 +180,27 @@ if __name__ == '__main__':
                 with torch.no_grad():
                     test_loss_action = 0.0
                     test_acc_action = 0.0
+                    test_loss_token_type = 0.0
+                    test_acc_token_type = 0.0
                     test_loss_reward = 0.0
                     test_acc_reward = 0.0
                     test_loss_next_state = 0.0
                     test_acc_next_state = 0.0
                     test_cnt = 0
+                    test_token_cnt = 0
 
                     for j, batch in enumerate(test_dataloader):
                         output = model(batch)
                         cnt = len(batch['states'])
                         test_loss_action += output['loss_action'].item() * cnt
                         test_acc_action += output['acc_action'].item() * cnt
+                        
+                        # Track token type metrics if in compressed context mode
+                        if config.get('use_compressed_context', False):
+                            if 'loss_token_type' in output:
+                                test_loss_token_type += output['loss_token_type'].item() * cnt
+                                test_acc_token_type += output['acc_token_type'].item() * cnt
+                                test_token_cnt += cnt
                             
                         if config['dynamics']:
                             test_loss_reward += output['loss_reward'].item() * cnt
@@ -201,7 +211,12 @@ if __name__ == '__main__':
                         test_cnt += cnt
 
                 writer.add_scalar('test/loss_action', test_loss_action / test_cnt, step)
-                writer.add_scalar('test/acc_action', test_acc_action / test_cnt, step)              
+                writer.add_scalar('test/acc_action', test_acc_action / test_cnt, step)
+                
+                # Log compressed context test metrics if enabled
+                if config.get('use_compressed_context', False) and test_token_cnt > 0:
+                    writer.add_scalar('test/loss_token_type', test_loss_token_type / test_token_cnt, step)
+                    writer.add_scalar('test/acc_token_type', test_acc_token_type / test_token_cnt, step)              
 
                 eval_end_time = datetime.now()
                 print()
