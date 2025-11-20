@@ -23,4 +23,8 @@ train_source_timesteps: 1000
 train_timesteps: 50000
 num_warmup_steps: 1000  
 
+# Multi-GPU training settings
+mixed_precision: 'no'  # Options: 'no', 'fp16', 'bf16' (use 'fp16' for faster training on GPUs)
+gradient_accumulation_steps: 1  # Increase if you run out of memory
+
 num_workers: 4

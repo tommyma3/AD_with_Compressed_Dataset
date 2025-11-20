@@ -50,17 +50,39 @@ if __name__ == '__main__':
         exit(0)        
 
     config['traj_dir'] = './datasets'
-    config['mixed_precision'] = 'fp32'
-
-    accelerator = Accelerator(mixed_precision='no')
+    
+    # Multi-GPU training configuration
+    # Set mixed_precision to 'fp16' or 'bf16' for faster training on supported GPUs
+    mixed_precision = config.get('mixed_precision', 'no')  # Options: 'no', 'fp16', 'bf16'
+    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+    
+    accelerator = Accelerator(
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        log_with="tensorboard",
+        project_dir=log_dir
+    )
+    
     config['device'] = accelerator.device
-    print('Using Device: ', config['device'])
+    
+    # Print multi-GPU info
+    if accelerator.is_main_process:
+        print('='*60)
+        print('Multi-GPU Training Configuration')
+        print('='*60)
+        print(f'Number of processes: {accelerator.num_processes}')
+        print(f'Distributed type: {accelerator.distributed_type}')
+        print(f'Mixed precision: {mixed_precision}')
+        print(f'Gradient accumulation steps: {gradient_accumulation_steps}')
+        print(f'Main process device: {config["device"]}')
+        print('='*60)
 
     model_name = config['model']
     model = MODEL[model_name](config)
 
     load_start_time = datetime.now()
-    print(f'Data loading started at {load_start_time}')
+    if accelerator.is_main_process:
+        print(f'Data loading started at {load_start_time}')
 
     train_dataset = ADDataset(config, config['traj_dir'], 'train', config['train_n_stream'], config['train_source_timesteps'])
     test_dataset = ADDataset(config, config['traj_dir'], 'test', 1, config['train_source_timesteps'])
@@ -71,9 +93,10 @@ if __name__ == '__main__':
     test_dataloader = get_data_loader(test_dataset, batch_size=config['test_batch_size'], config=config, shuffle=False)
     
     load_end_time = datetime.now()
-    print()
-    print(f'Data loading ended at {load_end_time}')
-    print(f'Elapsed time: {load_end_time - load_start_time}')
+    if accelerator.is_main_process:
+        print()
+        print(f'Data loading ended at {load_end_time}')
+        print(f'Elapsed time: {load_end_time - load_start_time}')
 
     optimizer = AdamW(model.parameters(), lr = config['lr'], betas=(config['beta1'], config['beta2']), weight_decay=config['weight_decay'])
     lr_sched = get_cosine_schedule_with_warmup(optimizer, config['num_warmup_steps'], config['train_timesteps'])
@@ -82,12 +105,13 @@ if __name__ == '__main__':
     ckpt_paths = sorted(glob(path.join(config['log_dir'], 'ckpt-*.pt')))
     if len(ckpt_paths) > 0:
         ckpt_path = ckpt_paths[-1]
-        ckpt = torch.load(ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location=accelerator.device)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         lr_sched.load_state_dict(ckpt['lr_sched'])
         step = ckpt['step']
-        print(f'Checkpoint loaded from {ckpt_path}')
+        if accelerator.is_main_process:
+            print(f'Checkpoint loaded from {ckpt_path}')
 
     env_name = config['env']
     train_env_args, test_env_args = SAMPLE_ENVIRONMENT[env_name](config)
@@ -103,9 +127,11 @@ if __name__ == '__main__':
     model, optimizer, train_dataloader, lr_sched = accelerator.prepare(model, optimizer, train_dataloader, lr_sched)
 
     start_time = datetime.now()
-    print(f'Trainig started at {start_time}')
+    if accelerator.is_main_process:
+        print(f'Training started at {start_time}')
 
-    with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=False) as pbar:
+    # Only show progress bar on main process
+    with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=not accelerator.is_main_process) as pbar:
         pbar.update(step)
 
         while True:
@@ -113,22 +139,25 @@ if __name__ == '__main__':
             
             step += 1
             
-            with accelerator.autocast():
-                output = model(batch)
-            
-            loss = output['loss_action']
+            # Use gradient accumulation context
+            with accelerator.accumulate(model):
+                with accelerator.autocast():
+                    output = model(batch)
+                
+                loss = output['loss_action']
 
-            optimizer.zero_grad()
-            accelerator.backward(loss)
-            accelerator.clip_grad_norm_(model.parameters(), 1)
-            optimizer.step()
+                optimizer.zero_grad()
+                accelerator.backward(loss)
+                accelerator.clip_grad_norm_(model.parameters(), 1)
+                optimizer.step()
 
-            if not accelerator.optimizer_step_was_skipped:
-                lr_sched.step()
+                if not accelerator.optimizer_step_was_skipped:
+                    lr_sched.step()
 
             pbar.set_postfix(loss=loss.item())
 
-            if step % config['summary_interval'] == 0:
+            # Only log from main process
+            if step % config['summary_interval'] == 0 and accelerator.is_main_process:
                 writer.add_scalar('train/loss', loss.item(), step)
                 writer.add_scalar('train/loss_action', output['loss_action'], step)
                 writer.add_scalar('train/lr', lr_sched.get_last_lr()[0], step)
@@ -141,8 +170,8 @@ if __name__ == '__main__':
                         writer.add_scalar('train/acc_token_type', output['acc_token_type'].item(), step)
 
 
-            # Eval
-            if step % config['eval_interval'] == 0:
+            # Eval (only on main process to avoid redundant computation)
+            if step % config['eval_interval'] == 0 and accelerator.is_main_process:
                 torch.cuda.empty_cache()
                 model.eval()
                 eval_start_time = datetime.now()
@@ -180,26 +209,36 @@ if __name__ == '__main__':
                 print(f'Elapsed time: {eval_end_time - eval_start_time}')
                 model.train()
                 torch.cuda.empty_cache()
+            
+            # Wait for all processes to finish evaluation
+            accelerator.wait_for_everyone()
 
             pbar.update(1)
 
-            # LOGGING
+            # LOGGING (only from main process)
             if step % config['ckpt_interval'] == 0:
-                # Remove old checkpoints
-                ckpt_paths = sorted(glob(path.join(config['log_dir'], 'ckpt-*.pt')))
-                for ckpt_path in ckpt_paths:
-                    os.remove(ckpt_path)
+                # Wait for all processes before saving
+                accelerator.wait_for_everyone()
+                
+                if accelerator.is_main_process:
+                    # Remove old checkpoints
+                    ckpt_paths = sorted(glob(path.join(config['log_dir'], 'ckpt-*.pt')))
+                    for ckpt_path in ckpt_paths:
+                        os.remove(ckpt_path)
 
-                new_ckpt_path = path.join(config['log_dir'], f'ckpt-{step}.pt')
+                    new_ckpt_path = path.join(config['log_dir'], f'ckpt-{step}.pt')
 
-                torch.save({
-                    'step': step,
-                    'config': config,
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_sched': lr_sched.state_dict(),
-                }, new_ckpt_path)
-                print(f'\nCheckpoint saved to {new_ckpt_path}')
+                    # Unwrap model to get original state dict
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    
+                    torch.save({
+                        'step': step,
+                        'config': config,
+                        'model': unwrapped_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_sched': lr_sched.state_dict(),
+                    }, new_ckpt_path)
+                    print(f'\nCheckpoint saved to {new_ckpt_path}')
 
             if step >= config['train_timesteps']:
                 break
@@ -207,7 +246,11 @@ if __name__ == '__main__':
     writer.flush()
     envs.close()
 
-    end_time = datetime.now()
-    print()
-    print(f'Training ended at {end_time}')
-    print(f'Elapsed time: {end_time - start_time}')
+    # Final synchronization
+    accelerator.wait_for_everyone()
+    
+    if accelerator.is_main_process:
+        end_time = datetime.now()
+        print()
+        print(f'Training ended at {end_time}')
+        print(f'Elapsed time: {end_time - start_time}')
