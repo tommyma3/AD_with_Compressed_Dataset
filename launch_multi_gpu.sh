@@ -12,6 +12,26 @@ set -e  # Exit on error
 # Default values
 NUM_GPUS="${1:-2}"
 CONFIG_PATH="${2:-config/model/ad_dr_compressed.yaml}"
+USE_UV="${USE_UV:-auto}"  # Set to 'yes', 'no', or 'auto' (default)
+
+# Detect if uv should be used
+if [ "$USE_UV" = "auto" ]; then
+    if command -v uv &> /dev/null; then
+        USE_UV="yes"
+        echo "Detected uv - will use 'uv run' for execution"
+    else
+        USE_UV="no"
+    fi
+fi
+
+# Set command prefix
+if [ "$USE_UV" = "yes" ]; then
+    CMD_PREFIX="uv run"
+    ACCELERATE_CMD="uv run accelerate"
+else
+    CMD_PREFIX=""
+    ACCELERATE_CMD="accelerate"
+fi
 
 echo "=================================================="
 echo "Multi-GPU Training Launcher"
@@ -19,14 +39,23 @@ echo "=================================================="
 echo "Configuration:"
 echo "  Number of GPUs: $NUM_GPUS"
 echo "  Config file: $CONFIG_PATH"
+echo "  Using uv: $USE_UV"
 echo "=================================================="
 echo ""
 
 # Check if accelerate is installed
-if ! command -v accelerate &> /dev/null; then
-    echo "ERROR: accelerate is not installed"
-    echo "Please install with: pip install accelerate"
-    exit 1
+if [ "$USE_UV" = "yes" ]; then
+    if ! uv run python -c "import accelerate" &> /dev/null; then
+        echo "ERROR: accelerate is not installed"
+        echo "Please install with: uv pip install accelerate"
+        exit 1
+    fi
+else
+    if ! command -v accelerate &> /dev/null; then
+        echo "ERROR: accelerate is not installed"
+        echo "Please install with: pip install accelerate"
+        exit 1
+    fi
 fi
 
 # Check if config file exists
@@ -39,7 +68,7 @@ fi
 if [ ! -f "$HOME/.cache/huggingface/accelerate/default_config.yaml" ]; then
     echo "WARNING: accelerate is not configured"
     echo "Running accelerate config..."
-    accelerate config
+    $ACCELERATE_CMD config
 fi
 
 # Check GPU availability
@@ -73,8 +102,9 @@ echo "=================================================="
 echo ""
 
 # Launch training
-accelerate launch \
+$ACCELERATE_CMD launch \
     --num_processes "$NUM_GPUS" \
+    --multi_gpu \
     --mixed_precision fp16 \
     train.py 2>&1 | tee "$LOG_DIR/training.log"
 

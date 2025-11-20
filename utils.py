@@ -35,17 +35,46 @@ def ad_collate_fn(batch, grid_size):
     res = {}
     res['query_states'] = torch.tensor(np.array([item['query_states'] for item in batch]), requires_grad=False, dtype=torch.float)
     res['target_actions'] = torch.tensor(np.array([item['target_actions'] for item in batch]), requires_grad=False, dtype=torch.long)
-    res['states'] = torch.tensor(np.array([item['states'] for item in batch]), requires_grad=False, dtype=torch.float)
-    res['actions'] = F.one_hot(torch.tensor(np.array([item['actions'] for item in batch]), requires_grad=False, dtype=torch.long), num_classes=5)
-    res['rewards'] = torch.tensor(np.array([item['rewards'] for item in batch]), dtype=torch.float, requires_grad=False)
-    res['next_states'] = torch.tensor(np.array([item['next_states'] for item in batch]), requires_grad=False, dtype=torch.float)
     
-    # Handle compression-specific fields
+    # Check if we're in compressed context mode with variable lengths
     if 'prev_region_len' in batch[0]:
-        res['prev_region_len'] = batch[0]['prev_region_len']  # Same for all in batch
-    
-    if 'curr_region_len' in batch[0]:
-        res['curr_region_len'] = batch[0]['curr_region_len']  # Same for all in batch
+        # Variable length sequences - need padding
+        max_len = max(len(item['states']) for item in batch)
+        
+        states_list = []
+        actions_list = []
+        rewards_list = []
+        next_states_list = []
+        
+        for item in batch:
+            seq_len = len(item['states'])
+            pad_len = max_len - seq_len
+            
+            # Pad sequences to max_len
+            states_padded = np.concatenate([item['states'], np.zeros((pad_len,) + item['states'].shape[1:], dtype=item['states'].dtype)])
+            actions_padded = np.concatenate([item['actions'], np.zeros((pad_len,), dtype=item['actions'].dtype)])
+            rewards_padded = np.concatenate([item['rewards'], np.zeros((pad_len,), dtype=item['rewards'].dtype)])
+            next_states_padded = np.concatenate([item['next_states'], np.zeros((pad_len,) + item['next_states'].shape[1:], dtype=item['next_states'].dtype)])
+            
+            states_list.append(states_padded)
+            actions_list.append(actions_padded)
+            rewards_list.append(rewards_padded)
+            next_states_list.append(next_states_padded)
+        
+        res['states'] = torch.tensor(np.stack(states_list), requires_grad=False, dtype=torch.float)
+        res['actions'] = F.one_hot(torch.tensor(np.stack(actions_list), requires_grad=False, dtype=torch.long), num_classes=5)
+        res['rewards'] = torch.tensor(np.stack(rewards_list), dtype=torch.float, requires_grad=False)
+        res['next_states'] = torch.tensor(np.stack(next_states_list), requires_grad=False, dtype=torch.float)
+        
+        # Store region lengths (same for all in batch)
+        res['prev_region_len'] = batch[0]['prev_region_len']
+        res['curr_region_len'] = batch[0]['curr_region_len']
+    else:
+        # Fixed length sequences - original logic
+        res['states'] = torch.tensor(np.array([item['states'] for item in batch]), requires_grad=False, dtype=torch.float)
+        res['actions'] = F.one_hot(torch.tensor(np.array([item['actions'] for item in batch]), requires_grad=False, dtype=torch.long), num_classes=5)
+        res['rewards'] = torch.tensor(np.array([item['rewards'] for item in batch]), dtype=torch.float, requires_grad=False)
+        res['next_states'] = torch.tensor(np.array([item['next_states'] for item in batch]), requires_grad=False, dtype=torch.float)
     
     # Handle target token types (for predicting compress tokens)
     if 'target_token_type' in batch[0]:

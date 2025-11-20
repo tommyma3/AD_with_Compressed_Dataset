@@ -20,11 +20,11 @@ lr: 0.0003
 train_batch_size: 512
 test_batch_size: 2048
 train_source_timesteps: 1000
-train_timesteps: 50000
+train_timesteps: 100000
 num_warmup_steps: 1000  
 
 # Multi-GPU training settings
-mixed_precision: 'no'  # Options: 'no', 'fp16', 'bf16' (use 'fp16' for faster training on GPUs)
+mixed_precision: 'fp16'  # Options: 'no', 'fp16', 'bf16' (use 'fp16' for faster training on GPUs)
 gradient_accumulation_steps: 1  # Increase if you run out of memory
 
-num_workers: 4
+num_workers: 12  # 4 workers per GPU for 3 GPUs - increase for better throughput
