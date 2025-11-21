@@ -121,6 +121,11 @@ class AD(torch.nn.Module):
             if not isinstance(curr_region_len, list):
                 curr_region_len = [curr_region_len] * batch_size
             
+            # Pre-compute token type embeddings once (avoid repeated tensor creation)
+            token_type_0 = self.token_type_embedding(torch.tensor([0], device=self.device))  # action
+            token_type_1 = self.token_type_embedding(torch.tensor([1], device=self.device))  # compress_start
+            token_type_2 = self.token_type_embedding(torch.tensor([2], device=self.device))  # compress_end
+            
             # Build sequence conditionally based on whether previous region exists
             # With prev: <compress> prev_region </compress> <compress> curr_region <query>
             # Without prev: <compress> curr_region <query>
@@ -132,38 +137,31 @@ class AD(torch.nn.Module):
                 if prev_region_len[b] > 0:
                     # Previous region with markers
                     # <compress>
-                    compress_start_embed = self.compress_start_token.squeeze(0) + self.token_type_embedding(
-                        torch.tensor([1], device=self.device))
+                    compress_start_embed = self.compress_start_token.squeeze(0) + token_type_1
                     seq_embeds.append(compress_start_embed)
                     
-                    # Previous region transitions
-                    for t in range(prev_region_len[b]):
-                        trans_embed = context_embed[b, t] + self.token_type_embedding(
-                            torch.tensor([0], device=self.device))
-                        seq_embeds.append(trans_embed)
+                    # Previous region transitions - vectorized operation
+                    prev_embeds = context_embed[b, :prev_region_len[b]] + token_type_0
+                    seq_embeds.append(prev_embeds)
                     
                     # </compress>
-                    compress_end_embed = self.compress_end_token.squeeze(0) + self.token_type_embedding(
-                        torch.tensor([2], device=self.device))
+                    compress_end_embed = self.compress_end_token.squeeze(0) + token_type_2
                     seq_embeds.append(compress_end_embed)
                     
                     context_offset = prev_region_len[b]
                 
                 # Current region with start marker
                 # <compress>
-                compress_start_embed = self.compress_start_token.squeeze(0) + self.token_type_embedding(
-                    torch.tensor([1], device=self.device))
+                compress_start_embed = self.compress_start_token.squeeze(0) + token_type_1
                 seq_embeds.append(compress_start_embed)
                 
-                # Current region transitions
-                for t in range(curr_region_len[b]):
-                    trans_embed = context_embed[b, context_offset + t] + self.token_type_embedding(
-                        torch.tensor([0], device=self.device))
-                    seq_embeds.append(trans_embed)
+                # Current region transitions - vectorized operation
+                if curr_region_len[b] > 0:
+                    curr_embeds = context_embed[b, context_offset:context_offset + curr_region_len[b]] + token_type_0
+                    seq_embeds.append(curr_embeds)
                 
                 # Query state
-                query_embed = query_states_embed[b] + self.token_type_embedding(
-                    torch.tensor([0], device=self.device))
+                query_embed = query_states_embed[b] + token_type_0
                 seq_embeds.append(query_embed)
                 
                 embeds_list.append(torch.cat(seq_embeds, dim=0))

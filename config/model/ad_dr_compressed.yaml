@@ -17,7 +17,7 @@ n_transit: 328  # 4 compression regions (4 * 82 tokens/region) for sampling flex
 
 # training
 lr: 0.0003  
-train_batch_size: 512
+train_batch_size: 1024  # Increased for 4 GPUs (256 per GPU)
 test_batch_size: 2048
 train_source_timesteps: 1000
 train_timesteps: 100000
@@ -27,4 +27,4 @@ num_warmup_steps: 1000
 mixed_precision: 'fp16'  # Options: 'no', 'fp16', 'bf16' (use 'fp16' for faster training on GPUs)
 gradient_accumulation_steps: 1  # Increase if you run out of memory
 
-num_workers: 12  # 4 workers per GPU for 3 GPUs - increase for better throughput
+num_workers: 16  # 4 workers per GPU for 4 GPUs - increase for better throughput

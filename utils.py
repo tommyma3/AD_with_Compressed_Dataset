@@ -43,40 +43,30 @@ def ad_collate_fn(batch, grid_size):
         # Handle both cases: with and without previous region
         
         # Find max length across all samples in batch (prev_region_len can vary!)
+        batch_size = len(batch)
         max_len = max(len(item['states']) for item in batch)
         
-        states_list = []
-        actions_list = []
-        rewards_list = []
-        next_states_list = []
+        # Pre-allocate arrays for better performance
+        state_shape = batch[0]['states'].shape[1:]
+        states_array = np.zeros((batch_size, max_len) + state_shape, dtype=batch[0]['states'].dtype)
+        actions_array = np.zeros((batch_size, max_len), dtype=batch[0]['actions'].dtype)
+        rewards_array = np.zeros((batch_size, max_len), dtype=batch[0]['rewards'].dtype)
+        next_states_array = np.zeros((batch_size, max_len) + state_shape, dtype=batch[0]['next_states'].dtype)
         
-        for item in batch:
+        # Fill arrays efficiently
+        for i, item in enumerate(batch):
             seq_len = len(item['states'])
-            pad_len = max_len - seq_len
-            
-            if pad_len > 0:
-                # Pad sequences to max_len
-                states_padded = np.concatenate([item['states'], np.zeros((pad_len,) + item['states'].shape[1:], dtype=item['states'].dtype)])
-                actions_padded = np.concatenate([item['actions'], np.zeros((pad_len,), dtype=item['actions'].dtype)])
-                rewards_padded = np.concatenate([item['rewards'], np.zeros((pad_len,), dtype=item['rewards'].dtype)])
-                next_states_padded = np.concatenate([item['next_states'], np.zeros((pad_len,) + item['next_states'].shape[1:], dtype=item['next_states'].dtype)])
-            else:
-                states_padded = item['states']
-                actions_padded = item['actions']
-                rewards_padded = item['rewards']
-                next_states_padded = item['next_states']
-            
-            states_list.append(states_padded)
-            actions_list.append(actions_padded)
-            rewards_list.append(rewards_padded)
-            next_states_list.append(next_states_padded)
+            states_array[i, :seq_len] = item['states']
+            actions_array[i, :seq_len] = item['actions']
+            rewards_array[i, :seq_len] = item['rewards']
+            next_states_array[i, :seq_len] = item['next_states']
         
-        res['states'] = torch.tensor(np.stack(states_list), requires_grad=False, dtype=torch.float)
-        res['actions'] = F.one_hot(torch.tensor(np.stack(actions_list), requires_grad=False, dtype=torch.long), num_classes=5)
-        res['rewards'] = torch.tensor(np.stack(rewards_list), dtype=torch.float, requires_grad=False)
-        res['next_states'] = torch.tensor(np.stack(next_states_list), requires_grad=False, dtype=torch.float)
+        res['states'] = torch.from_numpy(states_array).float()
+        res['actions'] = F.one_hot(torch.from_numpy(actions_array).long(), num_classes=5)
+        res['rewards'] = torch.from_numpy(rewards_array).float()
+        res['next_states'] = torch.from_numpy(next_states_array).float()
         
-        # Store region lengths (can vary per sample in batch now)
+        # Store region lengths as tensors for faster GPU transfer
         res['prev_region_len'] = [item['prev_region_len'] for item in batch]
         res['curr_region_len'] = [item['curr_region_len'] for item in batch]
     else:
@@ -102,7 +92,12 @@ def ad_collate_fn(batch, grid_size):
 
 def get_data_loader(dataset, batch_size, config, shuffle=True):
     collate_fn = partial(ad_collate_fn, grid_size=config['grid_size'])
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=config['num_workers'], persistent_workers=True)
+    num_workers = config.get('num_workers', 4)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, 
+                     num_workers=num_workers, 
+                     persistent_workers=(num_workers > 0),
+                     pin_memory=True,  # Faster CPU-to-GPU transfer
+                     prefetch_factor=2 if num_workers > 0 else None)  # Prefetch batches
 
 def log_in_context(values: np.ndarray, max_reward: int, episode_length: int, tag: str, title: str, xlabel: str, ylabel: str, step: int, success=None, writer=None) -> None:
     steps = np.arange(1, len(values[0])+1) * episode_length
