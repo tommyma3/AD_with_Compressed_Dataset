@@ -69,122 +69,122 @@ class ADDataset(Dataset):
             self._build_compression_index()
     
     def _build_compression_index(self):
-        """Build index of compression regions for efficient sampling."""
+        """Build index of compression regions for efficient sampling.
+        
+        Since PPO uses fixed n_steps=compress_interval, we can directly compute
+        region boundaries without searching through markers.
+        """
         self.compression_regions = []
+        self.valid_samples = []  # (hist_idx, region_idx, position_in_region, has_prev)
         
         for hist_idx in range(len(self.states)):
-            markers = self.compress_markers[hist_idx]
+            traj_len = len(self.states[hist_idx])
+            n_regions = traj_len // self.compress_interval
+            
             regions = []
-            start_idx = None
-            
-            for t in range(len(markers)):
-                if markers[t] == 1:  # compress_start
-                    start_idx = t
-                elif markers[t] == 2 and start_idx is not None:  # compress_end
-                    regions.append((start_idx, t + 1))  # [start, end)
-                    start_idx = None
-            
-            # Handle incomplete region at the end
-            if start_idx is not None:
-                regions.append((start_idx, len(markers)))
+            for r in range(n_regions):
+                start = r * self.compress_interval
+                end = start + self.compress_interval
+                regions.append((start, end))
             
             self.compression_regions.append(regions)
+            
+            # Pre-compute all valid sample indices
+            for region_idx in range(len(regions)):
+                region_start = regions[region_idx][0]
+                region_end = regions[region_idx][1]
+                # Sample at each position in the region
+                for pos in range(region_start, region_end):
+                    # First region: no previous region (matches eval cold start)
+                    # Other regions: include previous region
+                    has_prev = (region_idx > 0)
+                    self.valid_samples.append((hist_idx, region_idx, pos, has_prev))
     
     def __len__(self):
         if self.use_compressed_context:
-            # In compressed mode, sample at each position in regions that have a previous region
-            total_samples = 0
-            for regions in self.compression_regions:
-                for region_idx, (start, end) in enumerate(regions):
-                    if region_idx == 0:
-                        continue  # Skip first region (no previous)
-                    total_samples += end - start
-            return total_samples
+            return len(self.valid_samples)
         else:
             return (len(self.states[0]) - self.n_transit + 1) * len(self.states)
     
     def _get_compressed_context_sample(self, idx):
-        """Sample a sequence from one compression region + previous region, with markers as separate tokens.
+        """Fast sample using pre-computed index.
         
-        The sequence structure is:
-        <compress> t1, t2, ..., tn </compress> <compress> tn+1, tn+2, ..., query_state
-        
-        Where compression tokens are INSERTED as separate sequence elements.
+        The sequence structure depends on has_prev:
+        - With prev: <compress> prev_region(80 steps) </compress> <compress> curr_region(up to query) query_state
+        - Without prev: <compress> curr_region(up to query) query_state
         """
-        # Map linear index to (history_idx, region_idx, position_in_region)
-        cumulative = 0
-        for hist_idx, regions in enumerate(self.compression_regions):
-            for region_idx, (start, end) in enumerate(regions):
-                if region_idx == 0:
-                    continue  # Skip first region (no previous region to pair with)
-                
-                region_len = end - start
-                num_samples = region_len  # Sample at each position in the current region
-                
-                if idx < cumulative + num_samples:
-                    position = idx - cumulative
-                    transition_idx = start + position
-                    
-                    # Get previous complete region
-                    prev_start, prev_end = regions[region_idx - 1]
-                    
-                    # Build sequence with compression tokens as separate elements
-                    # Previous region: <compress> transitions </compress>
-                    prev_transitions = self.states[hist_idx, prev_start:prev_end]
-                    prev_actions = self.actions[hist_idx, prev_start:prev_end]
-                    prev_rewards = self.rewards[hist_idx, prev_start:prev_end]
-                    prev_next_states = self.next_states[hist_idx, prev_start:prev_end]
-                    
-                    # Current region: <compress> transitions up to query
-                    curr_transitions = self.states[hist_idx, start:transition_idx]
-                    curr_actions = self.actions[hist_idx, start:transition_idx]
-                    curr_rewards = self.rewards[hist_idx, start:transition_idx]
-                    curr_next_states = self.next_states[hist_idx, start:transition_idx]
-                    
-                    # Concatenate: prev_region + curr_region (markers will be inserted in model)
-                    context_states = np.concatenate([prev_transitions, curr_transitions]) if len(curr_transitions) > 0 else prev_transitions
-                    context_actions = np.concatenate([prev_actions, curr_actions]) if len(curr_transitions) > 0 else prev_actions
-                    context_rewards = np.concatenate([prev_rewards, curr_rewards]) if len(curr_transitions) > 0 else prev_rewards
-                    context_next_states = np.concatenate([prev_next_states, curr_next_states]) if len(curr_transitions) > 0 else prev_next_states
-                    
-                    # Create marker array: [0, 0, ..., 0 (prev region), 0, 0, ..., 0 (curr region)]
-                    # Markers will indicate where to insert compress tokens
-                    prev_len = len(prev_transitions)
-                    curr_len = len(curr_transitions)
-                    context_markers = np.zeros(prev_len + curr_len, dtype=np.int32)
-                    
-                    # Mark boundaries: insert compress_start before each region, compress_end after prev region
-                    # We'll use a special encoding: position of prev region start, prev region end, curr region start
-                    region_boundaries = {
-                        'prev_region_len': prev_len,
-                        'curr_region_len': curr_len,
-                    }
-                    
-                    # Determine target: are we predicting action or compress_end token?
-                    # If we're at the end of a compression interval, predict compress_end
-                    steps_in_current = transition_idx - start
-                    if steps_in_current > 0 and steps_in_current % self.compress_interval == 0:
-                        target_token_type = 2  # compress_end
-                        target_action = -1  # No action predicted
-                    else:
-                        target_token_type = 0  # action
-                        target_action = self.actions[hist_idx, transition_idx]
-                    
-                    return {
-                        'query_states': self.states[hist_idx, transition_idx],
-                        'target_actions': target_action,
-                        'states': context_states,
-                        'actions': context_actions,
-                        'rewards': context_rewards,
-                        'next_states': context_next_states,
-                        'prev_region_len': prev_len,
-                        'curr_region_len': curr_len,
-                        'target_token_type': target_token_type,
-                    }
-                
-                cumulative += num_samples
+        hist_idx, region_idx, transition_idx, has_prev = self.valid_samples[idx]
+        regions = self.compression_regions[hist_idx]
         
-        raise IndexError(f"Index {idx} out of range")
+        # Get current region up to query position
+        curr_start = regions[region_idx][0]
+        curr_len = transition_idx - curr_start  # Variable: 0 to compress_interval-1
+        
+        if has_prev:
+            # Get previous complete region (always 80 steps)
+            prev_start, prev_end = regions[region_idx - 1]
+            prev_len = prev_end - prev_start  # Always compress_interval
+            
+            # Extract sequences
+            prev_states = self.states[hist_idx, prev_start:prev_end]
+            prev_actions = self.actions[hist_idx, prev_start:prev_end]
+            prev_rewards = self.rewards[hist_idx, prev_start:prev_end]
+            prev_next_states = self.next_states[hist_idx, prev_start:prev_end]
+            
+            if curr_len > 0:
+                curr_states = self.states[hist_idx, curr_start:transition_idx]
+                curr_actions = self.actions[hist_idx, curr_start:transition_idx]
+                curr_rewards = self.rewards[hist_idx, curr_start:transition_idx]
+                curr_next_states = self.next_states[hist_idx, curr_start:transition_idx]
+                
+                # Concatenate regions
+                context_states = np.concatenate([prev_states, curr_states])
+                context_actions = np.concatenate([prev_actions, curr_actions])
+                context_rewards = np.concatenate([prev_rewards, curr_rewards])
+                context_next_states = np.concatenate([prev_next_states, curr_next_states])
+            else:
+                context_states = prev_states
+                context_actions = prev_actions
+                context_rewards = prev_rewards
+                context_next_states = prev_next_states
+        else:
+            # No previous region (first region, matches eval cold start)
+            prev_len = 0
+            
+            if curr_len > 0:
+                context_states = self.states[hist_idx, curr_start:transition_idx]
+                context_actions = self.actions[hist_idx, curr_start:transition_idx]
+                context_rewards = self.rewards[hist_idx, curr_start:transition_idx]
+                context_next_states = self.next_states[hist_idx, curr_start:transition_idx]
+            else:
+                # Very first step: no context at all
+                context_states = np.zeros((0,) + self.states.shape[2:], dtype=self.states.dtype)
+                context_actions = np.zeros((0,), dtype=self.actions.dtype)
+                context_rewards = np.zeros((0,), dtype=self.rewards.dtype)
+                context_next_states = np.zeros((0,) + self.next_states.shape[2:], dtype=self.next_states.dtype)
+        
+        # Determine target: predict compress_end at region boundaries
+        steps_in_current = transition_idx - curr_start
+        if steps_in_current == self.compress_interval - 1:
+            # Last step of region: predict compress_end
+            target_token_type = 2
+            target_action = -1
+        else:
+            # Normal step: predict action
+            target_token_type = 0
+            target_action = self.actions[hist_idx, transition_idx]
+        
+        return {
+            'query_states': self.states[hist_idx, transition_idx],
+            'target_actions': target_action,
+            'states': context_states,
+            'actions': context_actions,
+            'rewards': context_rewards,
+            'next_states': context_next_states,
+            'prev_region_len': prev_len,
+            'curr_region_len': curr_len,
+            'target_token_type': target_token_type,
+        }
     
     def __getitem__(self, i):
         if self.use_compressed_context:
