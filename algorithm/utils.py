@@ -35,20 +35,23 @@ class HistoryLoggerCallback(BaseCallback):
         
         # Handle compression markers
         # compress_markers: 0=normal, 1=compress_start, 2=compress_end
+        # PPO collects n_steps=80 transitions per rollout
+        # We mark: start of rollout (compress_start) and end of rollout (compress_end)
         marker = np.zeros_like(self.locals["dones"], dtype=np.int32)
         
         if self.insert_compress_start_next:
+            # Insert compress_start at the beginning of a new region
             marker[:] = 1  # compress_start
             self.insert_compress_start_next = False
-            self.steps_since_compress = 0
-        
-        self.steps_since_compress += 1
-        
-        # Check if we should insert compress_end marker
-        if self.steps_since_compress >= self.compress_interval:
-            marker[:] = 2  # compress_end
-            self.insert_compress_start_next = True  # Next step will be compress_start
-            self.steps_since_compress = 0
+            self.steps_since_compress = 1  # This is step 1 of the region
+        else:
+            self.steps_since_compress += 1
+            
+            # Check if we've completed compress_interval steps (reached end of region)
+            if self.steps_since_compress == self.compress_interval:
+                marker[:] = 2  # compress_end
+                self.insert_compress_start_next = True  # Next step starts new region
+                self.steps_since_compress = 0
         
         self.compress_markers.append(marker)
 

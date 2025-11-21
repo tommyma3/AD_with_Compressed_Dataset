@@ -30,12 +30,16 @@ def worker(arg, config, traj_dir, env_idx, history, file_name):
     callback = HistoryLoggerCallback(config['env'], env_idx, history, compress_interval=config['n_steps'])
     log_name = f'{file_name}_{env_idx}'
     
+    print(f'[Env {env_idx}] Starting training for goal: {arg}')
+    
     alg.learn(total_timesteps=config['total_source_timesteps'],
               callback=callback,
               log_interval=1,
               tb_log_name=log_name,
               reset_num_timesteps=True,
-              progress_bar=True)
+              progress_bar=False)
+    
+    print(f'[Env {env_idx}] Training completed for goal: {arg}')
     env.close()
 
 
