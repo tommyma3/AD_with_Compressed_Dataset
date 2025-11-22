@@ -68,6 +68,9 @@ if __name__ == '__main__':
     with open(path, 'wb') as f:
         np.save(f, test_rewards)
 
+    for i in range (8):
+        print(f'Env {i} reward: {test_rewards[i]}')
+
     print("Mean reward per environment:", test_rewards.mean(axis=1))
     print("Overall mean reward: ", test_rewards.mean())
     print("Std deviation: ", test_rewards.std())
