@@ -6,6 +6,9 @@ import os
 import sys
 sys.path.append(os.path.dirname(sys.path[0]))
 
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, message='.*cudaGetDeviceCount.*')
+
 import torch
 import os.path as path
 
@@ -23,10 +26,11 @@ torch.backends.cudnn.deterministic = True
 if __name__ == '__main__':
     ckpt_dir = './runs/AD-darkroom-seed0'
     ckpt_paths = sorted(glob(path.join(ckpt_dir, 'ckpt-*.pt')))
+    print(f'Using device: {device}')
 
     if len(ckpt_paths) > 0:
         ckpt_path = ckpt_paths[-1]
-        ckpt = torch.load(ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location=device)
         print(f'Checkpoint loaded from {ckpt_path}')
         config = ckpt['config']
     else:

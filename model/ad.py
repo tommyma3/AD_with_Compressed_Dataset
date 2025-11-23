@@ -214,7 +214,7 @@ class AD(torch.nn.Module):
             
             result['loss_token_type'] = loss_token_type
             result['acc_token_type'] = acc_token_type
-            result['loss_action'] = loss_action + 0.1 * loss_token_type  # Combined loss
+            result['loss_action'] = loss_action + loss_token_type  # Combined loss
             result['acc_action'] = acc_action
         else:
             # Standard mode
