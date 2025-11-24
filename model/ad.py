@@ -245,9 +245,11 @@ class AD(torch.nn.Module):
         
         # Track compression regions if using compressed context
         if self.use_compressed_context:
-            current_region = [compress_start_embed]  # Current compression region
-            previous_region = None  # Previous complete region
-            steps_in_region = 0
+            # Each environment maintains its own compression regions
+            num_envs = query_states_embed.shape[0]
+            current_regions = [[compress_start_embed[i:i+1]] for i in range(num_envs)]  # List per env
+            previous_regions = [None] * num_envs  # List per env
+            steps_in_region = [0] * num_envs  # Counter per env
 
         for step in range(eval_timesteps):
             query_states_prev = query_states.clone().detach().to(torch.float)
@@ -263,34 +265,68 @@ class AD(torch.nn.Module):
             logits_token_type = self.pred_token_type(output[:, -1])
             predicted_token_type = logits_token_type.argmax(dim=-1)
             
-            # Check if we should emit compress_end token
-            if self.use_compressed_context and (predicted_token_type == 2).any():
-                # Emit compress_end token, finalize current region, start new region
-                compress_end_embed = self.compress_end_token.expand(query_states_embed.shape[0], -1, -1)
-                compress_end_embed = compress_end_embed + self.token_type_embedding(
-                    torch.full((query_states_embed.shape[0], 1), 2, dtype=torch.long, device=self.device))
+            # Check if we should emit compress_end token (per environment)
+            if self.use_compressed_context:
+                compress_mask = (predicted_token_type == 2)  # Boolean mask per env
                 
-                current_region.append(compress_end_embed)
-                
-                # Save current region as previous, prune old previous
-                previous_region = torch.cat(current_region, dim=1) if len(current_region) > 1 else current_region[0]
-                
-                # Start new region with compress_start
-                compress_start_embed = self.compress_start_token.expand(query_states_embed.shape[0], -1, -1)
-                compress_start_embed = compress_start_embed + self.token_type_embedding(
-                    torch.full((query_states_embed.shape[0], 1), 1, dtype=torch.long, device=self.device))
-                
-                current_region = [compress_start_embed]
-                steps_in_region = 0
-                
-                # Rebuild transformer input: previous_region + current_region + query
-                if previous_region is not None:
-                    transformer_input, _ = pack([previous_region, compress_start_embed, query_states_embed], 'e * h')
-                else:
-                    transformer_input, _ = pack([compress_start_embed, query_states_embed], 'e * h')
-                
-                # Continue to next step without taking action
-                continue
+                if compress_mask.any():
+                    # Process each environment that needs compression
+                    for env_idx in range(query_states_embed.shape[0]):
+                        if compress_mask[env_idx]:
+                            # Emit compress_end token for this environment
+                            compress_end_embed = self.compress_end_token[0:1] + self.token_type_embedding(
+                                torch.tensor([2], dtype=torch.long, device=self.device))
+                            
+                            current_regions[env_idx].append(compress_end_embed)
+                            
+                            # Save current region as previous, prune old previous
+                            if len(current_regions[env_idx]) > 1:
+                                previous_regions[env_idx] = torch.cat(current_regions[env_idx], dim=1)
+                            else:
+                                previous_regions[env_idx] = current_regions[env_idx][0]
+                            
+                            # Start new region with compress_start
+                            compress_start_embed_new = self.compress_start_token[0:1] + self.token_type_embedding(
+                                torch.tensor([1], dtype=torch.long, device=self.device))
+                            
+                            current_regions[env_idx] = [compress_start_embed_new]
+                            steps_in_region[env_idx] = 0
+                    
+                    # Rebuild transformer input for ALL environments (even those that didn't compress)
+                    input_list = []
+                    for env_idx in range(query_states_embed.shape[0]):
+                        if previous_regions[env_idx] is not None:
+                            current_cat = torch.cat(current_regions[env_idx], dim=1) if len(current_regions[env_idx]) > 1 else current_regions[env_idx][0]
+                            env_input = torch.cat([previous_regions[env_idx], current_cat, query_states_embed[env_idx:env_idx+1]], dim=1)
+                        else:
+                            current_cat = torch.cat(current_regions[env_idx], dim=1) if len(current_regions[env_idx]) > 1 else current_regions[env_idx][0]
+                            env_input = torch.cat([current_cat, query_states_embed[env_idx:env_idx+1]], dim=1)
+                        
+                        # Trim if too long, keeping compress_start at beginning and query at end
+                        if env_input.size(1) > self.n_transit:
+                            # Keep first token (compress_start), trim from middle, keep last token (query)
+                            tokens_to_keep = self.n_transit - 2  # Reserve space for start and query
+                            env_input = torch.cat([
+                                env_input[:, :1],  # compress_start
+                                env_input[:, -(tokens_to_keep+1):-1],  # recent history
+                                env_input[:, -1:]  # query
+                            ], dim=1)
+                        
+                        input_list.append(env_input)
+                    
+                    # Pad to same length and stack
+                    max_len = max(inp.size(1) for inp in input_list)
+                    padded_inputs = []
+                    for inp in input_list:
+                        if inp.size(1) < max_len:
+                            pad = torch.zeros(1, max_len - inp.size(1), inp.size(2), device=self.device)
+                            inp = torch.cat([inp, pad], dim=1)
+                        padded_inputs.append(inp)
+                    transformer_input = torch.cat(padded_inputs, dim=0)
+                    
+                    # Continue to next step without taking action (for environments that compressed)
+                    # Note: This skips action for ALL envs if ANY compressed - may need refinement
+                    continue
             
             # Sample action
             if sample:
@@ -335,20 +371,42 @@ class AD(torch.nn.Module):
             
             # Handle compressed context mode during evaluation
             if self.use_compressed_context:
-                steps_in_region += 1
-                current_region.append(context_embed)
+                # Add transition to each environment's current region
+                for env_idx in range(query_states_embed.shape[0]):
+                    steps_in_region[env_idx] += 1
+                    current_regions[env_idx].append(context_embed[env_idx:env_idx+1])
                 
-                # Rebuild transformer input from regions
-                if previous_region is not None:
-                    current_region_cat = torch.cat(current_region, dim=1)
-                    transformer_input, _ = pack([previous_region, current_region_cat, query_states_embed], 'e * h')
-                else:
-                    current_region_cat = torch.cat(current_region, dim=1) if len(current_region) > 1 else current_region[0]
-                    transformer_input, _ = pack([current_region_cat, query_states_embed], 'e * h')
+                # Rebuild transformer input per environment
+                input_list = []
+                for env_idx in range(query_states_embed.shape[0]):
+                    if previous_regions[env_idx] is not None:
+                        current_cat = torch.cat(current_regions[env_idx], dim=1) if len(current_regions[env_idx]) > 1 else current_regions[env_idx][0]
+                        env_input = torch.cat([previous_regions[env_idx], current_cat, query_states_embed[env_idx:env_idx+1]], dim=1)
+                    else:
+                        current_cat = torch.cat(current_regions[env_idx], dim=1) if len(current_regions[env_idx]) > 1 else current_regions[env_idx][0]
+                        env_input = torch.cat([current_cat, query_states_embed[env_idx:env_idx+1]], dim=1)
+                    
+                    # Trim if too long, keeping compress_start at beginning and query at end
+                    if env_input.size(1) > self.n_transit:
+                        # Keep first token (compress_start), trim from middle, keep last token (query)
+                        tokens_to_keep = self.n_transit - 2  # Reserve space for start and query
+                        env_input = torch.cat([
+                            env_input[:, :1],  # compress_start
+                            env_input[:, -(tokens_to_keep+1):-1],  # recent history
+                            env_input[:, -1:]  # query
+                        ], dim=1)
+                    
+                    input_list.append(env_input)
                 
-                # Limit context length
-                if transformer_input.size(1) > self.n_transit:
-                    transformer_input = transformer_input[:, -self.n_transit:]
+                # Pad to same length and stack
+                max_len = max(inp.size(1) for inp in input_list)
+                padded_inputs = []
+                for inp in input_list:
+                    if inp.size(1) < max_len:
+                        pad = torch.zeros(1, max_len - inp.size(1), inp.size(2), device=self.device)
+                        inp = torch.cat([inp, pad], dim=1)
+                    padded_inputs.append(inp)
+                transformer_input = torch.cat(padded_inputs, dim=0)
             else:
                 # Original logic without compression
                 if transformer_input.size(1) > 1:

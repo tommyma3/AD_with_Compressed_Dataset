@@ -24,7 +24,15 @@ torch.backends.cudnn.deterministic = True
 
 
 if __name__ == '__main__':
-    ckpt_dir = './runs/AD-darkroom-seed0'
+    import argparse
+    parser = argparse.ArgumentParser(description='Evaluate AD model on specific goal')
+    parser.add_argument('--goal_idx', type=int, default=None, 
+                       help='Index of goal to evaluate (0-7). If not specified, evaluates all goals.')
+    parser.add_argument('--ckpt_dir', type=str, default='./runs/AD-darkroom-seed0',
+                       help='Directory containing checkpoint files')
+    args = parser.parse_args()
+    
+    ckpt_dir = args.ckpt_dir
     ckpt_paths = sorted(glob(path.join(ckpt_dir, 'ckpt-*.pt')))
     print(f'Using device: {device}')
 
@@ -44,10 +52,22 @@ if __name__ == '__main__':
     env_name = config['env']
     _, test_env_args = SAMPLE_ENVIRONMENT[env_name](config)
 
-    print("Evaluation goals: ", test_env_args)
+    print(f"Available test goals ({len(test_env_args)} total):")
+    for i, goal in enumerate(test_env_args):
+        print(f"  {i}: {goal}")
+    
+    # Select goal(s) to evaluate
+    if args.goal_idx is not None:
+        if args.goal_idx < 0 or args.goal_idx >= len(test_env_args):
+            raise ValueError(f'Goal index {args.goal_idx} out of range [0, {len(test_env_args)-1}]')
+        eval_goals = [test_env_args[args.goal_idx]]
+        print(f"\nEvaluating single goal {args.goal_idx}: {eval_goals[0]}")
+    else:
+        eval_goals = test_env_args
+        print(f"\nEvaluating all {len(eval_goals)} goals")
 
     if env_name == 'darkroom':
-        envs = SubprocVecEnv([make_env(config, goal=arg) for arg in test_env_args])
+        envs = SubprocVecEnv([make_env(config, goal=arg) for arg in eval_goals])
     else:
         raise NotImplemented(f'Environment not supported')
     
@@ -60,21 +80,28 @@ if __name__ == '__main__':
 
     with torch.no_grad():
         test_rewards = model.evaluate_in_context(vec_env=envs, eval_timesteps=config['horizon'] * 500)['reward_episode']
-        path = path.join(ckpt_dir, 'eval_result.npy')
+        save_path = path.join(ckpt_dir, f'eval_result_goal{args.goal_idx}.npy' if args.goal_idx is not None else 'eval_result.npy')
     
     end_time = datetime.now()
     print()
     print(f'Ended at {end_time}')
-    print(f'Elpased time: {end_time - start_time}')
+    print(f'Elapsed time: {end_time - start_time}')
 
     envs.close()
 
-    with open(path, 'wb') as f:
+    with open(save_path, 'wb') as f:
         np.save(f, test_rewards)
+    print(f'Results saved to {save_path}')
 
-    for i in range (8):
-        print(f'Env {i} reward: {test_rewards[i]}')
-
+    # Print results
+    print("\nEvaluation Results:")
+    print("=" * 60)
+    for i in range(len(eval_goals)):
+        goal = eval_goals[i]
+        reward = test_rewards[i]
+        print(f'Goal {args.goal_idx if args.goal_idx is not None else i} {goal}: {reward}')
+    
+    print()
     print("Mean reward per environment:", test_rewards.mean(axis=1))
     print("Overall mean reward: ", test_rewards.mean())
     print("Std deviation: ", test_rewards.std())
